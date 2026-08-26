@@ -4,7 +4,7 @@ description: An auxiliary skill to add more dylints to `tooling/lints`
 disable-model-invocation: false
 ---
 
-# Lint RULES
+# Lint rules
 
 1. Every lint MUST have accompanying `ui` tests
 2. `ui` tests MUST be in the `ui` folder

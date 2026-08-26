@@ -6,7 +6,7 @@ description: >-
   ITERATIONS/SEED reproduction, parking failures, and pending task traces.
 ---
 
-# GPUI Test Debugging
+# GPUI test debugging
 
 Use this skill when the user asks about `#[gpui::test]`, GPUI test seeds or iterations, deterministic scheduler failures, parking/pending task failures, or how to reproduce a flaky GPUI test.
 
@@ -38,31 +38,31 @@ Use these forms on `#[gpui::test(arguments)]`:
 - `seed = N`: adds a single explicit seed.
 - `seeds(...)`: adds multiple explicit seeds.
 - `iterations = N`: runs sequential seeds starting at `0` by default.
-- `retries = N`: retries a failing run up to `N` times before surfacing the failure.
+- `retries = N`: retries a failing run up to `N` times before reporting the failure.
 - `on_failure = "path::to::function"`: calls the function after final failure, before resuming the panic.
 - `iterations` can be combined with explicit `seed` / `seeds`; explicit seeds are appended to the `0..iterations` range.
 - If the `SEED` environment variable is set, it takes precedence over explicit seeds.
-- With `SEED=N` and `ITERATIONS=M` or `iterations = M`, the harness runs seeds `N..N+M`.
+- With `SEED=N` and `ITERATIONS=M` or `iterations = M`, the test macro runs seeds `N..N+M`.
 
 ## Environment variables
 
 ### GPUI test macro / scheduler execution
 
-- `SEED=<u64>` — chooses the scheduler seed. Use this to reproduce a failure printed as `failing seed: N`. It also seeds injected `StdRng` arguments. For `#[gpui::property_test]`, it controls the scheduler seed and GPUI applies it to the proptest config for deterministic case generation.
-- `ITERATIONS=<usize>` — overrides the `iterations = ...` value at runtime. Use to sweep many seeds without editing the test.
-- `PENDING_TRACES=1` or `PENDING_TRACES=true` — captures and prints pending task traces when the test scheduler panics with `Parking forbidden`. Use this when `run_until_parked()` or teardown reports pending work.
-- `GPUI_RUN_UNTIL_PARKED_LOG=1` — logs when `allow_parking()` is enabled. Use to find tests that explicitly permit parking/pending work.
-- `DEBUG_SCHEDULER=1` — prints scheduler clock/timer debugging from `scheduler::TestScheduler`.
+- `SEED=<u64>` chooses the scheduler seed. Use this to reproduce a failure printed as `failing seed: N`. It also seeds injected `StdRng` arguments. For `#[gpui::property_test]`, it controls the scheduler seed and GPUI applies it to the proptest config for deterministic case generation.
+- `ITERATIONS=<usize>` overrides the `iterations = ...` value at runtime. Use to sweep many seeds without editing the test.
+- `PENDING_TRACES=1` or `PENDING_TRACES=true` captures and prints pending task traces when the test scheduler panics with `Parking forbidden`. Use this when `run_until_parked()` or teardown reports pending work.
+- `GPUI_RUN_UNTIL_PARKED_LOG=1` logs when `allow_parking()` is enabled. Use to find tests that explicitly permit parking/pending work.
+- `DEBUG_SCHEDULER=1` prints scheduler clock/timer debugging from `scheduler::TestScheduler`.
 
 ### Lower-level scheduler tests
 
-- `SCHEDULER_NONINTERACTIVE=1` — suppresses interactive seed progress output in `scheduler::TestScheduler::many`. This does not affect the `#[gpui::test]` harness path.
+- `SCHEDULER_NONINTERACTIVE=1` suppresses interactive seed progress output in `scheduler::TestScheduler::many`. This does not affect the `#[gpui::test]` macro path.
 
 ### General Rust test debugging vars often useful with GPUI tests
 
-- `RUST_BACKTRACE=1` or `RUST_BACKTRACE=full` — show panic backtraces.
-- `RUST_LOG=<filter>` — enable logs when the test initializes logging.
-- `ZED_HEADLESS=1` — forces GPUI platform guessing toward headless mode; useful for tests that otherwise interact with platform/window setup.
+- `RUST_BACKTRACE=1` or `RUST_BACKTRACE=full` shows panic backtraces.
+- `RUST_LOG=<filter>` enables logs when the test initializes logging.
+- `ZED_HEADLESS=1` forces GPUI platform guessing toward headless mode. Useful for tests that otherwise interact with platform/window setup.
 
 Prefer env vars over editing the test when narrowing a reproduction.
 
@@ -88,7 +88,7 @@ Prefer env vars over editing the test when narrowing a reproduction.
    ITERATIONS=100 cargo -q test -p <crate-name> <test_name> -- --nocapture
    ```
 
-   When the harness prints `failing seed: <seed>`, switch to `SEED=<seed>` for all future debugging.
+   When the test runner prints `failing seed: <seed>`, switch to `SEED=<seed>` for all future debugging.
 
 5. If the failure is `Parking forbidden`, rerun with pending traces.
 

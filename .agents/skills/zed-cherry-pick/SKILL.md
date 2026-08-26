@@ -3,14 +3,14 @@ name: zed-cherry-pick
 description: Cherry-pick one or more merged PRs and/or commits into Zed's `preview` or `stable` release branch. Use this whenever the user mentions cherry-picking to preview/stable, a failed cherry-pick run, or wants to manually port fix(es) into a release branch.
 ---
 
-# Zed Cherry-Pick
+# Zed cherry-pick
 
 Zed ships from two long-lived release branches that live on `origin`:
 
 - `preview` channel → branch like `v1.4.x`
 - `stable` channel → branch like `v1.3.x`
 
-The version numbers change with each release. **Never hardcode them — always discover the current mapping** (see [Finding the target branch](#finding-the-target-branch)).
+The version numbers change with each release. **Never hardcode them. Always discover the current mapping** (see [Finding the target branch](#finding-the-target-branch)).
 
 A merged PR on `main` gets ported to a release branch by `script/cherry-pick`, normally driven by the `cherry_pick` GitHub Actions workflow. When that workflow fails (almost always a merge conflict), use this skill to finish the job locally and open the cherry-pick PR by hand.
 
@@ -21,7 +21,7 @@ Optionally, the user may specify whether to resolve merge conflicts; if unspecif
 
 ## The script you're emulating
 
-The canonical procedure lives in `script/cherry-pick` and the `cherry_pick` GitHub Actions workflow. Read the script first if anything looks off — your local steps must produce the same branch name, PR title, and PR body it would.
+The canonical procedure lives in `script/cherry-pick` and the `cherry_pick` GitHub Actions workflow. Read the script first if anything looks off. Your local steps must produce the same branch name, PR title, and PR body it would.
 
 Signature: `script/cherry-pick <branch-name> <commit-sha> <channel>`
 
@@ -61,11 +61,11 @@ gh run list --workflow=cherry_pick.yml --limit 10 --json databaseId,displayTitle
 gh run view <failed_run_id> --log-failed
 ```
 
-The failed-run log also confirms the `BRANCH` and `COMMIT` the workflow used — handy if there's any ambiguity.
+The failed-run log also confirms the `BRANCH` and `COMMIT` the workflow used. Handy if there's any ambiguity.
 
 ### 2. Reproduce the script's setup locally
 
-The repository may be a worktree (check `.git` — if it's a file, you're in a worktree pointing at a shared gitdir). That's fine; just operate normally.
+The repository may be a worktree (check `.git`. If it's a file, you're in a worktree pointing at a shared gitdir). That's fine; just operate normally.
 
 ```
 git --no-pager fetch origin <branch-name> <commit-sha>
@@ -94,7 +94,7 @@ Do this only after checking for missing prerequisite cherry-picks.
 - Inspect every conflicted file with `grep -n '<<<<<<<\\|>>>>>>>\\|=======' <path>` to find the markers.
 - Conflicts are usually `diff3` style with three sections: HEAD (release branch), `||||||| parent of <sha>` (merge base on `main`), and the incoming change.
 - Read the **original commit** (`git --no-pager show <commit-sha> -- <path>`) to understand the author's intent, then pick the resolution that produces the equivalent end state on the release branch.
-- Don't grab unrelated changes from `main` that happen to surround the conflict — keep the cherry-pick minimal.
+- Don't grab unrelated changes from `main` that happen to surround the conflict. Keep the cherry-pick minimal.
 
 ### 5. Validate
 
@@ -105,7 +105,7 @@ cargo check -p <affected_crate>
 cargo test  -p <affected_crate>
 ```
 
-If validation fails, fix the resolution — do **not** continue with a broken build. If you can't reach a clean state, abort with `git cherry-pick --abort` and report back to the user.
+If validation fails, fix the resolution. Do **not** continue with a broken build. If you can't reach a clean state, abort with `git cherry-pick --abort` and report back to the user.
 
 ### 6. Finish the cherry-pick
 
@@ -153,7 +153,7 @@ gh pr create --base <branch-name> --head cherry-pick-<branch-name>-<short-sha> \
   --body-file /tmp/cp-body.md
 ```
 
-Do **not** add a `Release Notes:` section — the original commit body already has one (or already says `N/A`), and you don't want it duplicated.
+Do **not** add a `Release Notes:` section. The original commit body already has one (or already says `N/A`), and you don't want it duplicated.
 
 ## Final report to the user
 
@@ -170,6 +170,6 @@ Tell the user:
 - **Don't expand the cherry-pick's scope**: when resolving conflicts, never pull in unrelated changes from `main` just because they sit next to the conflict region. The PR should be the smallest diff that reproduces the original commit's intent on the release branch.
 - **Channel branches are not called `preview`/`stable`**: don't try to `git fetch origin preview`. Look up the actual `vX.Y.x` branch name first.
 
-## When Finished
+## When finished
 
 After everything is finished, the last thing to do is to provide a link to the opened pull request(s) for the cherry-pick(s).

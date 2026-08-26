@@ -1,18 +1,18 @@
-# Documentation Automation Agent Guidelines
+# Documentation automation agent guidelines
 
 This file governs automated documentation updates triggered by code changes. All automation phases must comply with these rules.
 
-## Documentation System
+## Documentation system
 
 This documentation uses **mdBook** (https://rust-lang.github.io/mdBook/).
 
-### Key Files
+### Key files
 
 - **`docs/src/SUMMARY.md`**: Table of contents following mdBook format (https://rust-lang.github.io/mdBook/format/summary.html)
 - **`docs/book.toml`**: mdBook configuration
 - **`docs/.prettierrc`**: Prettier config (80 char line width)
 
-### SUMMARY.md Format
+### SUMMARY.md format
 
 The `SUMMARY.md` file defines the book structure. Format rules:
 
@@ -34,7 +34,7 @@ Example:
 # Another Section
 ```
 
-### Custom Preprocessor
+### Custom preprocessor
 
 The docs use a custom preprocessor (`docs_preprocessor`) that expands special commands:
 
@@ -49,7 +49,7 @@ The docs use a custom preprocessor (`docs_preprocessor`) that expands special co
 - Action names use `snake_case` in the namespace, `PascalCase` for the action
 - Common namespaces: `agent::`, `editor::`, `assistant::`, `vim::`
 
-### Formatting Requirements
+### Formatting requirements
 
 All documentation must pass **Prettier** formatting:
 
@@ -64,7 +64,7 @@ Before any documentation change is considered complete:
 
 Prettier config: 80 character line width (`docs/.prettierrc`)
 
-### Section Anchors
+### Section anchors
 
 Use `{#anchor-id}` syntax for linkable section headers:
 
@@ -80,7 +80,7 @@ Anchor IDs should be:
 - Unique within the page
 - Descriptive (can include parent context like `anthropic-custom-models`)
 
-### Code Block Annotations
+### Code block annotations
 
 Use annotations after the language identifier to indicate file context:
 
@@ -100,7 +100,7 @@ Use annotations after the language identifier to indicate file context:
 
 Valid annotations: `[settings]` (for settings.json), `[keymap]` (for keymap.json)
 
-### Blockquote Formatting
+### Blockquote formatting
 
 Use bold labels for callouts:
 
@@ -112,7 +112,7 @@ Use bold labels for callouts:
 > **Warn:** Caution about potential issues or gotchas.
 ```
 
-### Image References
+### Image references
 
 Images are hosted externally. Reference format:
 
@@ -120,15 +120,15 @@ Images are hosted externally. Reference format:
 ![Alt text description](https://zed.dev/img/path/to/image.webp)
 ```
 
-### Cross-Linking
+### Cross-linking
 
 - Relative links for same-directory: `[Agent Panel](./agent-panel.md)`
 - With anchors: `[Custom Models](./llm-providers.md#anthropic-custom-models)`
 - Parent directory: `[Telemetry](../telemetry.md)`
 
-## Voice and Tone
+## Voice and tone
 
-### Core Principles
+### Core principles
 
 - **Practical over promotional**: Focus on what users can do, not on selling Zed. Avoid marketing language like "powerful," "revolutionary," or "best-in-class."
 - **Honest about limitations**: When Zed lacks a feature or doesn't match another tool's depth, say so directly. Pair limitations with workarounds or alternative workflows.
@@ -136,15 +136,15 @@ Images are hosted externally. Reference format:
 - **Second person**: Address the reader as "you." Avoid "the user" or "one."
 - **Present tense**: "Zed opens the file" not "Zed will open the file."
 
-### What to Avoid
+### What to avoid
 
 - Superlatives without substance ("incredibly fast," "seamlessly integrated")
-- Hedging language ("simply," "just," "easily")—if something is simple, the instructions will show it
-- Apologetic tone for missing features—state the limitation and move on
-- Comparisons that disparage other tools—be factual, not competitive
+- Hedging language ("simply," "just," "easily"). If something is simple, the instructions will show it
+- Apologetic tone for missing features. State the limitation and move on
+- Comparisons that disparage other tools. Be factual, not competitive
 - Lots of use of em or en dashes.
 
-## Examples of Good Copy
+## Examples of good copy
 
 ### Good: Direct and actionable
 
@@ -181,14 +181,14 @@ While some users might miss indexing, Zed's approach is actually better because 
 
 ## Scope
 
-### In-Scope Documentation
+### In-scope documentation
 
 - All Markdown files in `docs/src/`
 - `docs/src/SUMMARY.md` (mdBook table of contents)
 - Language-specific docs in `docs/src/languages/`
 - Feature docs (AI, extensions, configuration, etc.)
 
-### Out-of-Scope (Do Not Modify)
+### Out-of-scope (do not modify)
 
 - `CHANGELOG.md`, `CONTRIBUTING.md`, `README.md` at repo root
 - Inline code comments and rustdoc
@@ -196,20 +196,20 @@ While some users might miss indexing, Zed's approach is actually better because 
 - Build configuration (`book.toml`, theme files, `docs_preprocessor`)
 - Any file outside `docs/src/`
 
-## Page Structure Patterns
+## Page structure patterns
 
-### Standard Page Layout
+### Standard page layout
 
 Most documentation pages follow this structure:
 
-1. **Title** (H1) - Single sentence or phrase
-2. **Overview/Introduction** - 1-3 paragraphs explaining what this is
-3. **Getting Started** `{#getting-started}` - Prerequisites and first steps
-4. **Main Content** - Feature details, organized by topic
-5. **Advanced/Configuration** - Power user options
-6. **See Also** (optional) - Related documentation links
+1. **Title** (H1), a single sentence or phrase
+2. **Overview/Introduction**, 1-3 paragraphs explaining what this is
+3. **Getting Started** `{#getting-started}`, prerequisites and first steps
+4. **Main Content**, feature details, organized by topic
+5. **Advanced/Configuration**, power user options
+6. **See Also** (optional), related documentation links
 
-### Settings Documentation Pattern
+### Settings documentation pattern
 
 When documenting settings:
 
@@ -228,7 +228,7 @@ When documenting settings:
 }
 ```
 
-### Provider/Feature Documentation Pattern
+### Provider/feature documentation pattern
 
 For each provider or distinct feature:
 
@@ -238,14 +238,14 @@ For each provider or distinct feature:
 4. Configuration example (JSON code block)
 5. Custom models section if applicable: `#### Custom Models {#provider-custom-models}`
 
-## Style Rules
+## Style rules
 
 Inherit all conventions from `docs/.rules`. Key points:
 
 ### Voice
 
 - Second person ("you"), present tense
-- Direct and concise—no hedging ("simply", "just", "easily")
+- Direct and concise, no hedging ("simply", "just", "easily")
 - Honest about limitations; no promotional language
 
 ### Formatting
@@ -266,9 +266,9 @@ Inherit all conventions from `docs/.rules`. Key points:
 | panel           | tool window, sidebar (be specific: "Project Panel," "Terminal Panel") |
 | language server | LSP (spell out first use, then LSP is fine)                           |
 
-## Zed-Specific Conventions
+## Zed-specific conventions
 
-### Recognized Rules Files
+### Recognized rules files
 
 When documenting rules/instructions for AI, note that Zed recognizes these files (in priority order):
 
@@ -282,21 +282,21 @@ When documenting rules/instructions for AI, note that Zed recognizes these files
 - `CLAUDE.md`
 - `GEMINI.md`
 
-### Settings File Locations
+### Settings file locations
 
 - macOS: `~/.config/zed/settings.json`
 - Linux: `~/.config/zed/settings.json`
 - Windows: `%AppData%\Zed\settings.json`
 
-### Keymap File Locations
+### Keymap file locations
 
 - macOS: `~/.config/zed/keymap.json`
 - Linux: `~/.config/zed/keymap.json`
 - Windows: `%AppData%\Zed\keymap.json`
 
-## Safety Constraints
+## Safety constraints
 
-### Must Not
+### Must not
 
 - Delete existing documentation files
 - Remove sections documenting existing functionality
@@ -312,9 +312,9 @@ When documenting rules/instructions for AI, note that Zed recognizes these files
 - Flag uncertainty explicitly rather than guessing
 - Link to related documentation when adding new sections
 
-## Change Classification
+## Change classification
 
-### Requires Documentation Update
+### Requires documentation update
 
 - New user-facing features or commands
 - Changed keybindings or default behaviors
@@ -322,7 +322,7 @@ When documenting rules/instructions for AI, note that Zed recognizes these files
 - Deprecated or removed functionality
 - API changes affecting extensions
 
-### Does Not Require Documentation Update
+### Does not require documentation update
 
 - Internal refactoring without behavioral changes
 - Performance optimizations (unless user-visible)
@@ -330,9 +330,9 @@ When documenting rules/instructions for AI, note that Zed recognizes these files
 - Test changes
 - CI/CD changes
 
-## Output Format
+## Output format
 
-### Phase 4 Documentation Plan
+### Phase 4 documentation plan
 
 When generating a documentation plan, use this structure:
 
@@ -367,7 +367,7 @@ Brief description of code changes analyzed.
 - [List files reviewed but not requiring updates, with brief reason]
 ```
 
-### Phase 6 Summary Format
+### Phase 6 summary format
 
 ```markdown
 ## Documentation Update Summary
@@ -387,9 +387,9 @@ Brief explanation of why these updates were made.
 Any items reviewers should pay special attention to.
 ```
 
-## Behavioral Guidelines
+## Behavioral guidelines
 
-### Conservative by Default
+### Conservative by default
 
 - When uncertain whether to document something, flag it for human review
 - Prefer smaller, focused updates over broad rewrites
@@ -400,7 +400,7 @@ Any items reviewers should pay special attention to.
 - Every documentation change should trace to a specific code change
 - Include references to relevant commits, PRs, or issues in summaries
 
-### Incremental Updates
+### Incremental updates
 
 - Update existing sections rather than creating parallel documentation
 - Maintain consistency with surrounding content
