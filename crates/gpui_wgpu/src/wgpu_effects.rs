@@ -45,6 +45,16 @@ struct LayerComposite {
     _pad: u32,
 }
 
+// `ParamsBuffer::write` reads these structs as raw bytes, which is only
+// sound when every byte is initialized. Both hold 4-byte fields alone, down
+// through `EffectLayer`, so the compiler inserts no padding. These fail the
+// build when a new field breaks that.
+const _: () = assert!(std::mem::size_of::<BlurParams>() == 16);
+const _: () = assert!(
+    std::mem::size_of::<LayerComposite>()
+        == std::mem::size_of::<Bounds<ScaledPixels>>() + std::mem::size_of::<EffectLayer>() + 4
+);
+
 /// Bind group layouts shared by the blur and composite pipelines.
 pub(crate) struct EffectLayouts {
     /// Group 1: one storage buffer with `BlurParams` or `LayerComposite`.
@@ -240,9 +250,11 @@ impl ParamsBuffer {
             let capacity = (offset + size).max(self.buffer.size() * 2);
             self.buffer = Self::create(frame.device, capacity);
         }
-        // SAFETY: `T` is a plain `repr(C)` struct of floats and integers
-        // whose padding the shader never reads, and the slice lives no
-        // longer than `data`.
+        // SAFETY: `T` is `BlurParams` or `LayerComposite`, both `repr(C)`
+        // with 4-byte fields alone, so no byte is padding and every byte is
+        // initialized. The assertions at the struct definitions keep that
+        // true, and the slice lives no longer than `data`. This is the same
+        // cast `instance_bytes` in the renderer does for scene primitives.
         let bytes =
             unsafe { std::slice::from_raw_parts(data as *const T as *const u8, size as usize) };
         frame.queue.write_buffer(&self.buffer, offset, bytes);
