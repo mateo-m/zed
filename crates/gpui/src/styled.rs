@@ -1,8 +1,8 @@
 use crate::{
-    self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CornerShape,
-    CursorStyle,
-    DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
-    FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
+    self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, Background, BlendMode,
+    BorderStyle, ColorMatrix, CornerShape, CursorStyle, DefiniteLength, Display, Fill,
+    FlexDirection, FlexWrap, Font, FontFeatures, FontStyle, FontWeight, GridPlacement,
+    GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length, Overscroll, Pixels,
     SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
     TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
 };
@@ -494,6 +494,113 @@ pub trait Styled: Sized {
         Self: Sized,
     {
         self.style().background = Some(fill.into());
+        self
+    }
+
+    /// Sets where a wheel event goes once this element cannot scroll with
+    /// it, per axis. CSS `overscroll-behavior`.
+    fn overscroll_behavior(mut self, x: Overscroll, y: Overscroll) -> Self
+    where
+        Self: Sized,
+    {
+        let point = &mut self.style().overscroll_behavior;
+        point.x = Some(x);
+        point.y = Some(y);
+        self
+    }
+
+    /// Sets a fill painted over the background colour, like CSS
+    /// `background-image`.
+    fn background_image(mut self, image: impl Into<Background>) -> Self
+    where
+        Self: Sized,
+    {
+        self.style().background_image = Some(image.into());
+        self
+    }
+
+    /// Sets how the background image mixes with the background colour. CSS
+    /// `background-blend-mode`.
+    fn background_blend_mode(mut self, mode: BlendMode) -> Self
+    where
+        Self: Sized,
+    {
+        self.style().background_blend_mode = Some(mode);
+        self
+    }
+
+    /// Blurs the picture of the element and its children. CSS `filter: blur()`.
+    fn blur(mut self, sigma: Pixels) -> Self
+    where
+        Self: Sized,
+    {
+        self.style()
+            .effects
+            .get_or_insert_with(Default::default)
+            .blur = sigma;
+        self
+    }
+
+    /// Runs the picture of the element through a colour matrix, which is
+    /// what the CSS `filter` functions do.
+    fn color_matrix(mut self, matrix: ColorMatrix) -> Self
+    where
+        Self: Sized,
+    {
+        self.style()
+            .effects
+            .get_or_insert_with(Default::default)
+            .color_matrix = matrix;
+        self
+    }
+
+    /// Blurs what is under the element. CSS `backdrop-filter: blur()`.
+    fn backdrop_blur(mut self, sigma: Pixels) -> Self
+    where
+        Self: Sized,
+    {
+        self.style()
+            .effects
+            .get_or_insert_with(Default::default)
+            .backdrop_blur = sigma;
+        self
+    }
+
+    /// Runs what is under the element through a colour matrix. The other
+    /// CSS `backdrop-filter` functions.
+    fn backdrop_matrix(mut self, matrix: ColorMatrix) -> Self
+    where
+        Self: Sized,
+    {
+        self.style()
+            .effects
+            .get_or_insert_with(Default::default)
+            .backdrop_matrix = matrix;
+        self
+    }
+
+    /// Keeps each pixel of the element by the alpha of `mask` at that
+    /// point. CSS `mask-image`.
+    fn mask(mut self, mask: impl Into<Background>) -> Self
+    where
+        Self: Sized,
+    {
+        self.style()
+            .effects
+            .get_or_insert_with(Default::default)
+            .mask = Some(mask.into());
+        self
+    }
+
+    /// Sets how the element mixes with what is under it. CSS `mix-blend-mode`.
+    fn blend_mode(mut self, mode: BlendMode) -> Self
+    where
+        Self: Sized,
+    {
+        self.style()
+            .effects
+            .get_or_insert_with(Default::default)
+            .blend_mode = mode;
         self
     }
 

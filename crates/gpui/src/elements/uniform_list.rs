@@ -383,6 +383,8 @@ impl Element for UniformList {
             inspector_id,
             bounds,
             content_size,
+            None,
+            None,
             window,
             cx,
             |_style, mut scroll_offset, hitbox, window, cx| {

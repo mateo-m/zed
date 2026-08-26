@@ -446,6 +446,8 @@ impl Element for Img {
             inspector_id,
             bounds,
             bounds.size,
+            None,
+            None,
             window,
             cx,
             |_, _, hitbox, window, cx| {

@@ -112,6 +112,8 @@ impl Element for Svg {
             inspector_id,
             bounds,
             bounds.size,
+            None,
+            None,
             window,
             cx,
             |_, _, hitbox, _, _| hitbox,

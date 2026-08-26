@@ -21,8 +21,8 @@ use crate::{
     FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
     IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
     LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
-    MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
+    MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, Overscroll,
+    ParentElement, PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
     StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
     size,
 };
@@ -1914,6 +1914,16 @@ impl Element for Div {
 
         let mut child_min = point(Pixels::MAX, Pixels::MAX);
         let mut child_max = Point::default();
+        let mut flow_child_edge: Option<Point<Pixels>> = None;
+        let mut absolute_child_edge: Option<Point<Pixels>> = None;
+        let mut note_child_edge = |edge: Point<Pixels>, absolute: bool| {
+            let slot = if absolute {
+                &mut absolute_child_edge
+            } else {
+                &mut flow_child_edge
+            };
+            *slot = Some(slot.map_or(edge, |max| max.max(&edge)));
+        };
         if let Some(handle) = self.interactivity.scroll_anchor.as_ref() {
             *handle.last_origin.borrow_mut() = bounds.origin - window.element_offset();
         }
@@ -1926,6 +1936,10 @@ impl Element for Div {
                 let child_bounds = window.layout_bounds(*child_layout_id);
                 child_min = child_min.min(&child_bounds.origin);
                 child_max = child_max.max(&child_bounds.bottom_right());
+                note_child_edge(
+                    child_bounds.bottom_right(),
+                    window.layout_position_is_absolute(*child_layout_id),
+                );
                 state.child_bounds.push(child_bounds);
             }
             (child_max - child_min).into()
@@ -1934,6 +1948,10 @@ impl Element for Div {
                 let child_bounds = window.layout_bounds(*child_layout_id);
                 child_min = child_min.min(&child_bounds.origin);
                 child_max = child_max.max(&child_bounds.bottom_right());
+                note_child_edge(
+                    child_bounds.bottom_right(),
+                    window.layout_position_is_absolute(*child_layout_id),
+                );
 
                 if has_prepaint_listener {
                     children_bounds.push(child_bounds);
@@ -1951,6 +1969,8 @@ impl Element for Div {
             inspector_id,
             bounds,
             content_size,
+            flow_child_edge,
+            absolute_child_edge,
             window,
             cx,
             |style, scroll_offset, hitbox, window, cx| {
@@ -2070,6 +2090,17 @@ pub struct Interactivity {
     pub hovered: Option<bool>,
     pub(crate) tooltip_id: Option<TooltipId>,
     pub(crate) content_size: Size<Pixels>,
+    /// The furthest bottom right edge of an in-flow child, in window
+    /// pixels. The scroll range runs to this edge plus the end-side
+    /// padding, the CSS scrollable overflow.
+    pub(crate) flow_child_edge: Option<Point<Pixels>>,
+    /// The furthest bottom right edge of a `position: absolute` child.
+    /// The scroll range runs to this edge as is. CSS adds no end-side
+    /// padding after an absolutely positioned box.
+    pub(crate) absolute_child_edge: Option<Point<Pixels>>,
+    /// The scroll range this frame, from `clamp_scroll_position`. The
+    /// wheel handler reads it so both use one formula.
+    pub(crate) scroll_max: Point<Pixels>,
     pub(crate) key_context: Option<KeyContext>,
     pub(crate) focusable: bool,
     pub(crate) tracked_focus_handle: Option<FocusHandle>,
@@ -2235,11 +2266,15 @@ impl Interactivity {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         content_size: Size<Pixels>,
+        flow_child_edge: Option<Point<Pixels>>,
+        absolute_child_edge: Option<Point<Pixels>>,
         window: &mut Window,
         cx: &mut App,
         f: impl FnOnce(&Style, Point<Pixels>, Option<Hitbox>, &mut Window, &mut App) -> R,
     ) -> R {
         self.content_size = content_size;
+        self.flow_child_edge = flow_child_edge;
+        self.absolute_child_edge = absolute_child_edge;
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         window.with_inspector_state(
@@ -2362,7 +2397,7 @@ impl Interactivity {
     }
 
     fn clamp_scroll_position(
-        &self,
+        &mut self,
         bounds: Bounds<Pixels>,
         style: &Style,
         window: &mut Window,
@@ -2393,10 +2428,22 @@ impl Interactivity {
             // 0.00000x pixels. As we generally don't benefit from a precision that
             // high for the maximum scroll, we round the scroll max to 2 decimal
             // places here.
-            let padded_content_size = self.content_size + padding_size;
-            let scroll_max = Point::from(padded_content_size - bounds.size)
-                .map(round_to_two_decimals)
-                .max(&Default::default());
+            let padded_flow_edge = self
+                .flow_child_edge
+                .map(|edge| edge + point(padding.right, padding.bottom));
+            let child_edge = match (padded_flow_edge, self.absolute_child_edge) {
+                (Some(flow), Some(absolute)) => Some(flow.max(&absolute)),
+                (edge, None) | (None, edge) => edge,
+            };
+            let scroll_max = match child_edge {
+                Some(edge) => (edge - bounds.bottom_right())
+                    .map(round_to_two_decimals)
+                    .max(&Default::default()),
+                None => Point::from(self.content_size + padding_size - bounds.size)
+                    .map(round_to_two_decimals)
+                    .max(&Default::default()),
+            };
+            self.scroll_max = scroll_max;
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
             // were removed or the bounds became larger).
             let mut scroll_offset = scroll_offset.borrow_mut();
@@ -2514,13 +2561,17 @@ impl Interactivity {
                                                 );
                                             }
 
+                                            // Bubble listeners run last to first, so the
+                                            // scroll listener goes first: the element's own
+                                            // wheel listeners then see the event before it
+                                            // stops there.
+                                            self.paint_scroll_listener(hitbox, &style, window, cx);
                                             self.paint_mouse_listeners(
                                                 hitbox,
                                                 element_state.as_mut(),
                                                 window,
                                                 cx,
                                             );
-                                            self.paint_scroll_listener(hitbox, &style, window, cx);
                                         }
 
                                         self.paint_keyboard_listeners(window, cx);
@@ -3259,6 +3310,8 @@ impl Interactivity {
             let overflow = style.overflow;
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
+            let overscroll = style.overscroll_behavior;
+            let scroll_max = self.scroll_max;
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
@@ -3302,10 +3355,19 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
-                    scroll_offset.y += delta_y;
-                    scroll_offset.x += delta_x;
-                    if *scroll_offset != old_scroll_offset {
+                    scroll_offset.y = (scroll_offset.y + delta_y).clamp(-scroll_max.y, px(0.));
+                    scroll_offset.x = (scroll_offset.x + delta_x).clamp(-scroll_max.x, px(0.));
+                    let scrolled = *scroll_offset != old_scroll_offset;
+                    if scrolled {
                         cx.notify(current_view);
+                    }
+                    // Like the web, the event reaches an outer scroll
+                    // container only when this one had nowhere to go, and
+                    // never on an axis that says to keep it.
+                    let kept_x = !delta.x.is_zero() && overscroll.x != Overscroll::Auto;
+                    let kept_y = !delta.y.is_zero() && overscroll.y != Overscroll::Auto;
+                    if scrolled || kept_x || kept_y {
+                        cx.stop_propagation();
                     }
                 }
             });

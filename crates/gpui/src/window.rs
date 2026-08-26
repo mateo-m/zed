@@ -5,25 +5,24 @@ use crate::Inspector;
 #[cfg(feature = "profiler")]
 use crate::profiler;
 use crate::{
-    CornerShape,
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, KeyListener,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
-    transparent_black,
+    Capslock, Context, CornerShape, Corners, CursorHideMode, CursorStyle, Decorations,
+    DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect,
+    EffectLayer, Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId,
+    GlyphId, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    KeyListener, Keystroke, KeystrokeEvent, LayerEffects, LayoutId, LineLayoutIndex, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
+    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams, WindowTextSystem,
+    point, prelude::*, px, rems, size, transparent_black,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -4010,6 +4009,59 @@ impl Window {
         result
     }
 
+    /// Draws everything `f` paints into a texture of its own, then paints
+    /// that texture over the frame with `effects`. This is how `filter`,
+    /// `backdrop-filter`, `mask-image` and `mix-blend-mode` reach the GPU.
+    /// The corners clip the backdrop effect the way CSS clips it to the
+    /// border box. When `effects` does nothing, `f` paints straight into the
+    /// frame.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_effect_layer<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        corner_shapes: Corners<CornerShape>,
+        effects: &LayerEffects,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+
+        let content_mask = self.content_mask();
+        let clipped_bounds = bounds.intersect(&content_mask.bounds);
+        if effects.is_none() || clipped_bounds.is_empty() {
+            return f(self);
+        }
+
+        let scale_factor = self.scale_factor();
+        let opacity = self.element_opacity();
+        let layer = EffectLayer {
+            bounds: self.cover_bounds(clipped_bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii: corner_radii.scale(scale_factor),
+            corner_shapes: corner_shapes.map(|shape| shape.0),
+            blur: effects.blur.0 * scale_factor,
+            backdrop_blur: effects.backdrop_blur.0 * scale_factor,
+            opacity,
+            blend_mode: effects.blend_mode as u32,
+            has_mask: effects.mask.is_some() as u32,
+            has_backdrop: effects.has_backdrop() as u32,
+            clips_content: effects.clips as u32,
+            color_matrix: effects.color_matrix.0,
+            backdrop_matrix: effects.backdrop_matrix.0,
+            mask: effects.mask.unwrap_or_default(),
+        };
+        self.next_frame.scene.push_effect_layer(layer);
+        // The layer applies the opacity once to its whole picture, so the
+        // content inside paints at full opacity.
+        let saved_opacity = self.element_opacity;
+        self.element_opacity = 1.0;
+        let result = f(self);
+        self.element_opacity = saved_opacity;
+        self.next_frame.scene.pop_effect_layer();
+        result
+    }
+
     /// Paint the drop (non-inset) shadows from `shadows` into the scene at the current
     /// z-index. Inset shadows are skipped; paint those with [`Self::paint_inset_shadows`]
     /// after the element's background so they layer on top of the fill.
@@ -4763,6 +4815,17 @@ impl Window {
         let snapped_offset = self.pixel_snap_point(self.element_offset());
         bounds.origin += snapped_offset;
         bounds
+    }
+
+    /// True when the layout node behind the given LayoutId has
+    /// `position: absolute`. The scroll range treats such a child by its
+    /// own edge, without the end-side padding that follows the in-flow
+    /// content, as CSS does.
+    pub fn layout_position_is_absolute(&mut self, layout_id: LayoutId) -> bool {
+        self.layout_engine
+            .as_ref()
+            .unwrap()
+            .position_is_absolute(layout_id)
     }
 
     /// This method should be called during `prepaint`. You can use
