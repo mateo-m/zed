@@ -303,8 +303,13 @@ pub struct Style {
     /// `background-image` over `background-color`.
     pub background_image: Option<Background>,
 
-    /// How `background_image` mixes with `background`. CSS
-    /// `background-blend-mode`.
+    /// How `background_image` mixes with the pixels under it. When
+    /// `background` is opaque, those pixels are the background color, and
+    /// this matches CSS `background-blend-mode`. When `background` lets the
+    /// content behind the element show through, the mix includes that
+    /// content, the way CSS `mix-blend-mode` does. CSS instead blends with
+    /// transparent there, which needs an isolated backdrop that the
+    /// renderer does not have.
     pub background_blend_mode: BlendMode,
 
     /// What the element does to the picture of itself and its children.

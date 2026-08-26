@@ -4822,10 +4822,11 @@ impl Window {
     /// own edge, without the end-side padding that follows the in-flow
     /// content, as CSS does.
     pub fn layout_position_is_absolute(&mut self, layout_id: LayoutId) -> bool {
+        // The engine is only absent while a frame computes. A caller that
+        // lands here then gets the in-flow answer instead of a panic.
         self.layout_engine
             .as_ref()
-            .unwrap()
-            .position_is_absolute(layout_id)
+            .is_some_and(|engine| engine.position_is_absolute(layout_id))
     }
 
     /// This method should be called during `prepaint`. You can use
