@@ -51,6 +51,14 @@ struct Hsla {
 struct LinearColorStop {
     Hsla color;
     float percentage;
+    // Where between this stop and the next the mix is half way. 0 = none.
+    float hint;
+    // Cubic bezier control points that ease the mix to the next stop. All
+    // zero = none.
+    float ease_x1;
+    float ease_y1;
+    float ease_x2;
+    float ease_y2;
 };
 
 struct Background {
@@ -63,14 +71,12 @@ struct Background {
     uint color_space;
     Hsla solid;
     float gradient_angle_or_pattern_height;
-    LinearColorStop colors[2];
-    uint pad;
-};
-
-struct GradientColor {
-  float4 solid;
-  float4 color0;
-  float4 color1;
+    // Only the first `stop_count` are live.
+    LinearColorStop colors[8];
+    uint stop_count;
+    // 0 = the angle applies, 1..4 = the line points at a corner: top left,
+    // top right, bottom right, bottom left.
+    uint corner;
 };
 
 struct AtlasTextureId {
@@ -287,6 +293,77 @@ float4 to_device_position_transformed(float2 unit_vertex, Bounds bounds,
 }
 
 // Implementation of quad signed distance field
+float pick_corner_shape(float2 center_to_point, Corners corner_shapes) {
+    if (center_to_point.x < 0.) {
+        if (center_to_point.y < 0.) {
+            return corner_shapes.top_left;
+        } else {
+            return corner_shapes.bottom_left;
+        }
+    } else {
+        if (center_to_point.y < 0.) {
+            return corner_shapes.top_right;
+        } else {
+            return corner_shapes.bottom_right;
+        }
+    }
+}
+
+// Signed distance from a point in the positive quadrant to the superellipse
+// (x/a)^n + (y/b)^n = 1. Negative inside. n is 1 for a straight line between
+// the axes, 2 for an ellipse, and infinity for the a by b box.
+//
+// The distance is the value of the implicit function over the length of its
+// gradient, which is exact for a line and a circle and close elsewhere. The
+// terms are scaled by the largest coordinate first so a big n never
+// underflows the whole sum to zero.
+float superellipse_sdf(float2 pt, float2 radii, float n) {
+    if (n > 1e30) {
+        float2 to_edge = pt - radii;
+        return max(to_edge.x, to_edge.y);
+    }
+    float2 unit = pt / radii;
+    float largest = max(max(unit.x, unit.y), 1e-6);
+    float2 scaled = unit / largest;
+    float rho = largest * pow(pow(scaled.x, n) + pow(scaled.y, n), 1.0 / n);
+    float2 gradient = pow(scaled * (largest / rho), n - 1.0) / radii;
+    return (rho - 1.0) / max(length(gradient), 1e-6);
+}
+
+// The outer and inner signed distances for one corner whose shape is not a
+// plain quarter circle. `shape` is the CSS superellipse curvature: the curve
+// is a superellipse with exponent 2^|shape|, centered on the corner circle's
+// center when the shape is convex and on the outer corner when it is
+// concave. The inner edge keeps the same shape at the border's distance.
+float2 shaped_corner_sdf(float2 corner_to_point, float2 corner_center_to_point,
+                         float corner_radius, float shape, float2 reduced_border,
+                         float2 straight_border_inner_corner_to_point) {
+    float n = abs(shape) < 64.0 ? exp2(abs(shape)) : 1e31;
+    float straight_outer = max(corner_to_point.x, corner_to_point.y);
+    float straight_inner = -max(straight_border_inner_corner_to_point.x,
+                                straight_border_inner_corner_to_point.y);
+    float2 radii = float2(corner_radius, corner_radius);
+    if (shape < 0.0) {
+        // The bite sits at the outer corner and reaches the whole corner box,
+        // and its inner edge reaches further, so measure everywhere.
+        float2 from_corner = max(-corner_to_point, float2(0.0, 0.0));
+        float bite = superellipse_sdf(from_corner, radii, n);
+        float inner_bite = superellipse_sdf(from_corner, radii + reduced_border, n);
+        return float2(max(straight_outer, -bite), min(straight_inner, inner_bite));
+    }
+    bool near_corner = corner_center_to_point.x >= 0.0 && corner_center_to_point.y >= 0.0;
+    if (!near_corner) {
+        return float2(straight_outer, straight_inner);
+    }
+    float outer = superellipse_sdf(corner_center_to_point, radii, n);
+    float2 inner_radii = radii - reduced_border;
+    float inner = straight_inner;
+    if (inner_radii.x > 0.0 && inner_radii.y > 0.0) {
+        inner = -superellipse_sdf(corner_center_to_point, inner_radii, n);
+    }
+    return float2(outer, inner);
+}
+
 float quad_sdf_impl(float2 corner_center_to_point, float corner_radius) {
     if (corner_radius == 0.0) {
         // Fast path for unrounded corners
@@ -314,24 +391,111 @@ float quad_sdf(float2 pt, Bounds bounds, Corners corner_radii) {
     return quad_sdf_impl(corner_center_to_point, corner_radius);
 }
 
-GradientColor prepare_gradient_color(uint tag, uint color_space, Hsla solid, LinearColorStop colors[2]) {
-    GradientColor output;
-    if (tag == 0 || tag == 2 || tag == 3) {
-        output.solid = hsla_to_rgba(solid);
-    } else if (tag == 1) {
-        output.color0 = hsla_to_rgba(colors[0].color);
-        output.color1 = hsla_to_rgba(colors[1].color);
+// The solid color of a fill, converted once per vertex. Gradients convert
+// their stops per fragment instead, since only two of them matter there.
+float4 prepare_fill_color(Background background) {
+    if (background.tag == 1) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    return hsla_to_rgba(background.solid);
+}
 
-        // Prepare color space in vertex for avoid conversion
-        // in fragment shader for performance reasons
-        if (color_space == 1) {
-            // Oklab
-            output.color0 = srgb_to_oklab(output.color0);
-            output.color1 = srgb_to_oklab(output.color1);
+// The eased fraction for `x` along a cubic bezier with control points `e`,
+// from (0, 0) to (1, 1). Newton's method solves the x curve for t, then the
+// y curve reads the eased value. Zero control points mean no easing.
+float bezier_ease(float x, float4 e) {
+    if (all(e == float4(0.0, 0.0, 0.0, 0.0))) {
+        return x;
+    }
+    float t = x;
+    for (int i = 0; i < 8; i++) {
+        float u = 1.0 - t;
+        float fx = 3.0 * u * u * t * e.x + 3.0 * u * t * t * e.z + t * t * t - x;
+        float dx = 3.0 * u * u * e.x + 6.0 * u * t * (e.z - e.x) + 3.0 * t * t * (1.0 - e.z);
+        if (abs(dx) < 1e-6) {
+            break;
+        }
+        t = clamp(t - fx / dx, 0.0, 1.0);
+    }
+    float u = 1.0 - t;
+    return 3.0 * u * u * t * e.y + 3.0 * u * t * t * e.w + t * t * t;
+}
+
+// One gradient stop in the space the gradient mixes in.
+float4 gradient_stop_color(Background background, uint index) {
+    float4 color = hsla_to_rgba(background.colors[index].color);
+    if (background.color_space == 1) {
+        color = srgb_to_oklab(color);
+    }
+    return color;
+}
+
+// The color of a CSS linear gradient at `position`.
+//
+// The gradient line goes through the center of the box. Its length is the
+// one CSS Images 3 defines, so 0% and 100% sit exactly on the corners the
+// line points away from and toward. A corner keyword makes the line
+// perpendicular to the diagonal between the two other corners.
+float4 linear_gradient_color(Background background, float2 position, Bounds bounds) {
+    float2 size = bounds.size;
+    float angle;
+    if (background.corner == 0) {
+        angle = background.gradient_angle_or_pattern_height * (M_PI_F / 180.0);
+    } else {
+        float toward_top_right = atan2(size.y, size.x);
+        switch (background.corner) {
+            case 1: angle = 2.0 * M_PI_F - toward_top_right; break;
+            case 2: angle = toward_top_right; break;
+            case 3: angle = M_PI_F - toward_top_right; break;
+            default: angle = M_PI_F + toward_top_right; break;
         }
     }
+    float2 direction = float2(sin(angle), -cos(angle));
+    float line_length = abs(size.x * sin(angle)) + abs(size.y * cos(angle));
+    float2 center = bounds.origin + size / 2.0;
+    float t = (dot(position - center, direction) + line_length / 2.0)
+        / max(line_length, 1e-6);
 
-    return output;
+    uint last = background.stop_count - 1;
+    float4 color;
+    if (t <= background.colors[0].percentage) {
+        color = gradient_stop_color(background, 0);
+    } else if (t >= background.colors[last].percentage) {
+        color = gradient_stop_color(background, last);
+    } else {
+        uint i = 0;
+        while (i + 1 < last && t > background.colors[i + 1].percentage) {
+            i++;
+        }
+        float start = background.colors[i].percentage;
+        float end = background.colors[i + 1].percentage;
+        float p = end > start ? (t - start) / (end - start) : 1.0;
+        // A color hint moves the half-way point of the mix between two stops.
+        float hint = background.colors[i].hint;
+        if (hint > 0.0 && hint < 1.0) {
+            p = pow(p, log(0.5) / log(hint));
+        }
+        // An easing bends the mix between two stops.
+        LinearColorStop stop = background.colors[i];
+        p = bezier_ease(p, float4(stop.ease_x1, stop.ease_y1, stop.ease_x2, stop.ease_y2));
+        color = lerp(gradient_stop_color(background, i),
+                     gradient_stop_color(background, i + 1), p);
+    }
+    if (background.color_space == 1) {
+        color = oklab_to_srgb(color);
+    }
+
+    // Dither to reduce banding in gradients (especially dark/alpha).
+    // Triangular-distributed noise breaks up 8-bit quantization steps.
+    // ±2/255 for RGB (enough for dark-on-dark compositing),
+    // ±3/255 for alpha (needs more because alpha × dark color = tiny steps).
+    float2 seed = position * 0.6180339887; // golden ratio spread
+    float r1 = frac(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
+    float r2 = frac(sin(dot(seed, float2(39.3460, 11.135))) * 24634.6345);
+    float tri = r1 + r2 - 1.0; // triangular PDF, range [-1, +1]
+    color.rgb += tri * 2.0 / 255.0;
+    color.a   += tri * 3.0 / 255.0;
+    return color;
 }
 
 float2x2 rotate2d(float angle) {
@@ -343,70 +507,16 @@ float2x2 rotate2d(float angle) {
 float4 gradient_color(Background background,
                       float2 position,
                       Bounds bounds,
-                      float4 solid_color, float4 color0, float4 color1) {
+                      float4 solid_color) {
     float4 color;
 
     switch (background.tag) {
         case 0:
             color = solid_color;
             break;
-        case 1: {
-            // -90 degrees to match the CSS gradient angle.
-            float gradient_angle = background.gradient_angle_or_pattern_height;
-            float radians = (fmod(gradient_angle, 360.0) - 90.0) * (M_PI_F / 180.0);
-            float2 direction = float2(cos(radians), sin(radians));
-
-            // Expand the short side to be the same as the long side
-            if (bounds.size.x > bounds.size.y) {
-                direction.y *= bounds.size.y / bounds.size.x;
-            } else {
-                direction.x *=  bounds.size.x / bounds.size.y;
-            }
-
-            // Get the t value for the linear gradient with the color stop percentages.
-            float2 half_size = bounds.size * 0.5;
-            float2 center = bounds.origin + half_size;
-            float2 center_to_point = position - center;
-            float t = dot(center_to_point, direction) / length(direction);
-            // Check the direct to determine the use x or y
-            if (abs(direction.x) > abs(direction.y)) {
-                t = (t + half_size.x) / bounds.size.x;
-            } else {
-                t = (t + half_size.y) / bounds.size.y;
-            }
-
-            // Adjust t based on the stop percentages
-            t = (t - background.colors[0].percentage)
-                / (background.colors[1].percentage
-                - background.colors[0].percentage);
-            t = clamp(t, 0.0, 1.0);
-
-            switch (background.color_space) {
-                case 0:
-                    color = lerp(color0, color1, t);
-                    break;
-                case 1: {
-                    float4 oklab_color = lerp(color0, color1, t);
-                    color = oklab_to_srgb(oklab_color);
-                    break;
-                }
-            }
-
-            // Dither to reduce banding in gradients (especially dark/alpha).
-            // Triangular-distributed noise breaks up 8-bit quantization steps.
-            // ±2/255 for RGB (enough for dark-on-dark compositing),
-            // ±3/255 for alpha (needs more because alpha × dark color = tiny steps).
-            {
-                float2 seed = position * 0.6180339887; // golden ratio spread
-                float r1 = frac(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
-                float r2 = frac(sin(dot(seed, float2(39.3460, 11.135))) * 24634.6345);
-                float tri = r1 + r2 - 1.0; // triangular PDF, range [-1, +1]
-                color.rgb += tri * 2.0 / 255.0;
-                color.a   += tri * 3.0 / 255.0;
-            }
-
+        case 1:
+            color = linear_gradient_color(background, position, bounds);
             break;
-        }
         case 2: {
             float gradient_angle_or_pattern_height = background.gradient_angle_or_pattern_height;
             float pattern_width = (gradient_angle_or_pattern_height / 65535.0f) / 255.0f;
@@ -507,6 +617,7 @@ struct Quad {
     Hsla border_color;
     Corners corner_radii;
     Edges border_widths;
+    Corners corner_shapes;
 };
 
 struct QuadVertexOutput {
@@ -514,8 +625,6 @@ struct QuadVertexOutput {
     float4 position: SV_Position;
     nointerpolation float4 border_color: COLOR0;
     nointerpolation float4 background_solid: COLOR1;
-    nointerpolation float4 background_color0: COLOR2;
-    nointerpolation float4 background_color1: COLOR3;
     float4 clip_distance: SV_ClipDistance;
 };
 
@@ -524,8 +633,6 @@ struct QuadFragmentInput {
     float4 position: SV_Position;
     nointerpolation float4 border_color: COLOR0;
     nointerpolation float4 background_solid: COLOR1;
-    nointerpolation float4 background_color0: COLOR2;
-    nointerpolation float4 background_color1: COLOR3;
 };
 
 StructuredBuffer<Quad> quads: register(t1);
@@ -536,12 +643,7 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
     Quad quad = quads[quad_id];
     float4 device_position = to_device_position(unit_vertex, quad.bounds);
 
-    GradientColor gradient = prepare_gradient_color(
-        quad.background.tag,
-        quad.background.color_space,
-        quad.background.solid,
-        quad.background.colors
-    );
+    float4 background_solid = prepare_fill_color(quad.background);
     float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
     float4 border_color = hsla_to_rgba(quad.border_color);
 
@@ -549,9 +651,7 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
     output.position = device_position;
     output.border_color = border_color;
     output.quad_id = quad_id;
-    output.background_solid = gradient.solid;
-    output.background_color0 = gradient.color0;
-    output.background_color1 = gradient.color1;
+    output.background_solid = background_solid;
     output.clip_distance = clip_distance;
     return output;
 }
@@ -559,7 +659,7 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
 float4 quad_fragment(QuadFragmentInput input): SV_Target {
     Quad quad = quads[input.quad_id];
     float4 background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
-    input.background_solid, input.background_color0, input.background_color1);
+        input.background_solid);
 
     bool unrounded = quad.corner_radii.top_left == 0.0 &&
         quad.corner_radii.top_right == 0.0 &&
@@ -584,8 +684,9 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     // minimum distance between the center of the pixel and the edge.
     const float antialias_threshold = 0.5;
 
-    // Radius of the nearest corner
+    // Radius and shape of the nearest corner
     float corner_radius = pick_corner_radius(center_to_point, quad.corner_radii);
+    float corner_shape = pick_corner_shape(center_to_point, quad.corner_shapes);
 
     float2 border = float2(
         center_to_point.x < 0.0 ? quad.border_widths.left : quad.border_widths.right,
@@ -634,31 +735,42 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
         return background_color;
     }
 
-    // Signed distance of the point to the outside edge of the quad's border
-    float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+    float outer_sdf;
+    float inner_sdf;
+    if (corner_shape == 1.0 || corner_radius == 0.0) {
+        // Signed distance of the point to the outside edge of the quad's border
+        outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
 
-    // Approximate signed distance of the point to the inside edge of the quad's
-    // border. It is negative outside this edge (within the border), and
-    // positive inside.
-    //
-    // This is not always an accurate signed distance:
-    // * The rounded portions with varying border width use an approximation of
-    //   nearest-point-on-ellipse.
-    // * When it is quickly known to be outside the edge, -1.0 is used.
-    float inner_sdf = 0.0;
-    if (corner_center_to_point.x <= 0.0 || corner_center_to_point.y <= 0.0) {
-        // Fast paths for straight borders
-        inner_sdf = -max(straight_border_inner_corner_to_point.x,
-                        straight_border_inner_corner_to_point.y);
-    } else if (is_beyond_inner_straight_border) {
-        // Fast path for points that must be outside the inner edge
-        inner_sdf = -1.0;
-    } else if (reduced_border.x == reduced_border.y) {
-        // Fast path for circular inner edge.
-        inner_sdf = -(outer_sdf + reduced_border.x);
+        // Approximate signed distance of the point to the inside edge of the quad's
+        // border. It is negative outside this edge (within the border), and
+        // positive inside.
+        //
+        // This is not always an accurate signed distance:
+        // * The rounded portions with varying border width use an approximation of
+        //   nearest-point-on-ellipse.
+        // * When it is quickly known to be outside the edge, -1.0 is used.
+        inner_sdf = 0.0;
+        if (corner_center_to_point.x <= 0.0 || corner_center_to_point.y <= 0.0) {
+            // Fast paths for straight borders
+            inner_sdf = -max(straight_border_inner_corner_to_point.x,
+                            straight_border_inner_corner_to_point.y);
+        } else if (is_beyond_inner_straight_border) {
+            // Fast path for points that must be outside the inner edge
+            inner_sdf = -1.0;
+        } else if (reduced_border.x == reduced_border.y) {
+            // Fast path for circular inner edge.
+            inner_sdf = -(outer_sdf + reduced_border.x);
+        } else {
+            float2 ellipse_radii = max(float2(0.0, 0.0), float2(corner_radius, corner_radius) - reduced_border);
+            inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
+        }
     } else {
-        float2 ellipse_radii = max(float2(0.0, 0.0), float2(corner_radius, corner_radius) - reduced_border);
-        inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
+        // Any other corner shape: a superellipse, or a bite out of the corner.
+        float2 sdfs = shaped_corner_sdf(corner_to_point, corner_center_to_point,
+                                        corner_radius, corner_shape, reduced_border,
+                                        straight_border_inner_corner_to_point);
+        outer_sdf = sdfs.x;
+        inner_sdf = sdfs.y;
     }
 
     // Negative when inside the border
@@ -1011,11 +1123,8 @@ float4 path_rasterization_fragment(PathFragmentInput input): SV_Target {
         alpha = saturate(0.5 - distance);
     }
 
-    GradientColor gradient = prepare_gradient_color(
-        background.tag, background.color_space, background.solid, background.colors);
-
     float4 color = gradient_color(background, input.position.xy, bounds,
-        gradient.solid, gradient.color0, gradient.color1);
+        prepare_fill_color(background));
     return float4(color.rgb * color.a * alpha, alpha * color.a);
 }
 
@@ -1265,4 +1374,392 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     }
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
+}
+
+/*
+**
+**              Effect layers
+**
+*/
+
+// The renderer draws the content of an effect layer into its own texture.
+// These shaders then blur that texture and paint it over the frame with a
+// colour matrix, a mask and a blend mode. Every texture here holds
+// premultiplied colour. The composite pipeline runs with blending off, so
+// the fragment shader mixes the result with the pixel under it by hand.
+//
+// The blur and the composite read their source at t0 through s_sprite,
+// which the renderer binds to a linear clamp sampler for these draws.
+
+struct BlurParams {
+    float2 step;
+    float sigma;
+    int radius;
+};
+
+struct EffectLayer {
+    Bounds bounds;
+    Bounds content_mask;
+    Corners corner_radii;
+    Corners corner_shapes;
+    float blur;
+    float backdrop_blur;
+    float opacity;
+    uint blend_mode;
+    uint has_mask;
+    uint has_backdrop;
+    uint clips_content;
+    float color_matrix[20];
+    float backdrop_matrix[20];
+    Background mask;
+};
+
+struct LayerComposite {
+    EffectLayer layer;
+    Bounds region;
+};
+
+StructuredBuffer<BlurParams> blur_params: register(t1);
+StructuredBuffer<LayerComposite> layer_composites: register(t1);
+Texture2D<float4> t_layer_under: register(t2);
+Texture2D<float4> t_layer_backdrop: register(t3);
+Texture2D<float4> t_layer_backdrop_mid: register(t4);
+Texture2D<float4> t_layer_backdrop_low: register(t5);
+SamplerState s_layer_exact: register(s1);
+
+struct BlurVertexOutput {
+    float4 position: SV_Position;
+    float2 uv: TEXCOORD0;
+};
+
+BlurVertexOutput blur_vertex(uint vertex_id: SV_VertexID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    BlurVertexOutput output;
+    output.position = float4(unit_vertex.x * 2.0 - 1.0, 1.0 - unit_vertex.y * 2.0, 0.0, 1.0);
+    output.uv = unit_vertex;
+    return output;
+}
+
+// One separable gaussian pass. The step is one source texel along the axis
+// of this pass.
+float4 blur_fragment(BlurVertexOutput input): SV_Target {
+    BlurParams params = blur_params[0];
+    float sigma = max(params.sigma, 1e-3);
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+    float weight_sum = 0.0;
+    [loop]
+    for (int i = -params.radius; i <= params.radius; i++) {
+        float2 uv = input.uv + params.step * float(i);
+        if (any(uv < 0.0) || any(uv > 1.0)) {
+            continue;
+        }
+        float weight = exp(-0.5 * float(i * i) / (sigma * sigma));
+        sum += weight * t_sprite.SampleLevel(s_sprite, uv, 0.0);
+        weight_sum += weight;
+    }
+    return sum / weight_sum;
+}
+
+// A row-major 4 by 5 matrix on straight (not premultiplied) rgba.
+float4 apply_color_matrix(float m[20], float4 c) {
+    return float4(
+        m[0] * c.r + m[1] * c.g + m[2] * c.b + m[3] * c.a + m[4],
+        m[5] * c.r + m[6] * c.g + m[7] * c.b + m[8] * c.a + m[9],
+        m[10] * c.r + m[11] * c.g + m[12] * c.b + m[13] * c.a + m[14],
+        m[15] * c.r + m[16] * c.g + m[17] * c.b + m[18] * c.a + m[19]);
+}
+
+float4 unpremultiply(float4 c) {
+    return c.a > 0.0 ? float4(c.rgb / c.a, c.a) : float4(0.0, 0.0, 0.0, 0.0);
+}
+
+float4 premultiply(float4 c) {
+    return float4(c.rgb * c.a, c.a);
+}
+
+// Runs a premultiplied colour through a matrix, clamped, premultiplied again.
+float4 filter_color(float m[20], float4 premultiplied) {
+    float4 c = apply_color_matrix(m, unpremultiply(premultiplied));
+    return premultiply(saturate(c));
+}
+
+float lum(float3 c) {
+    return dot(c, float3(0.3, 0.59, 0.11));
+}
+
+float3 clip_color(float3 c) {
+    float l = lum(c);
+    float n = min(c.r, min(c.g, c.b));
+    float x = max(c.r, max(c.g, c.b));
+    if (n < 0.0) {
+        c = l + (c - l) * l / max(l - n, 1e-5);
+    }
+    if (x > 1.0) {
+        c = l + (c - l) * (1.0 - l) / max(x - l, 1e-5);
+    }
+    return c;
+}
+
+float3 set_lum(float3 c, float l) {
+    return clip_color(c + (l - lum(c)));
+}
+
+float sat(float3 c) {
+    return max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
+}
+
+float3 set_sat(float3 c, float s) {
+    float mx = max(c.r, max(c.g, c.b));
+    float mn = min(c.r, min(c.g, c.b));
+    if (mx <= mn) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    return (c - mn) * s / (mx - mn);
+}
+
+// Separable blend modes, one channel at a time. `b` is the backdrop and `s`
+// is the source, both in straight alpha.
+float blend_channel(uint mode, float b, float s) {
+    switch (mode) {
+        case 1: return b * s;
+        case 2: return b + s - b * s;
+        case 3: return b <= 0.5 ? s * 2.0 * b : 1.0 - (1.0 - s) * (1.0 - (2.0 * b - 1.0));
+        case 4: return min(b, s);
+        case 5: return max(b, s);
+        case 6:
+            if (b == 0.0) return 0.0;
+            if (s >= 1.0) return 1.0;
+            return min(1.0, b / (1.0 - s));
+        case 7:
+            if (b >= 1.0) return 1.0;
+            if (s <= 0.0) return 0.0;
+            return 1.0 - min(1.0, (1.0 - b) / s);
+        case 8: return s <= 0.5 ? b * 2.0 * s : 1.0 - (1.0 - b) * (1.0 - (2.0 * s - 1.0));
+        case 9: {
+            float d = b <= 0.25 ? ((16.0 * b - 12.0) * b + 4.0) * b : sqrt(b);
+            return s <= 0.5 ? b - (1.0 - 2.0 * s) * b * (1.0 - b)
+                            : b + (2.0 * s - 1.0) * (d - b);
+        }
+        case 10: return abs(b - s);
+        case 11: return b + s - 2.0 * b * s;
+        default: return s;
+    }
+}
+
+float3 blend_colors(uint mode, float3 b, float3 s) {
+    switch (mode) {
+        case 0: return s;
+        case 12: return set_lum(set_sat(s, sat(b)), lum(b));
+        case 13: return set_lum(set_sat(b, sat(s)), lum(b));
+        case 14: return set_lum(s, lum(b));
+        case 15: return set_lum(b, lum(s));
+        case 16: return s;
+        default:
+            return float3(blend_channel(mode, b.r, s.r), blend_channel(mode, b.g, s.g),
+                          blend_channel(mode, b.b, s.b));
+    }
+}
+
+// Paints a premultiplied source over a premultiplied backdrop with a blend
+// mode, as Compositing and Blending 1 says.
+float4 blend_over(uint mode, float4 backdrop, float4 source) {
+    if (mode == 16) {
+        return min(backdrop + source, float4(1.0, 1.0, 1.0, 1.0));
+    }
+    if (mode != 0 && source.a > 0.0 && backdrop.a > 0.0) {
+        float3 cs = source.rgb / source.a;
+        float3 cb = backdrop.rgb / backdrop.a;
+        float3 mixed = (1.0 - backdrop.a) * cs + backdrop.a * blend_colors(mode, cb, cs);
+        source = float4(mixed * source.a, source.a);
+    }
+    return source + backdrop * (1.0 - source.a);
+}
+
+// How much of the pixel at `position` lies inside the box, with its
+// corners shaped like a quad without a border.
+float box_coverage(float2 position, Bounds bounds, Corners corner_radii, Corners corner_shapes) {
+    float2 half_size = bounds.size / 2.0;
+    float2 center = bounds.origin + half_size;
+    float2 center_to_point = position - center;
+    float corner_radius = pick_corner_radius(center_to_point, corner_radii);
+    float corner_shape = pick_corner_shape(center_to_point, corner_shapes);
+    float2 corner_to_point = abs(center_to_point) - half_size;
+    float2 corner_center_to_point = corner_to_point + corner_radius;
+    float sdf;
+    if (corner_shape == 1.0 || corner_radius == 0.0) {
+        sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+    } else {
+        float2 no_border = float2(-0.5, -0.5);
+        sdf = shaped_corner_sdf(corner_to_point, corner_center_to_point, corner_radius,
+                                corner_shape, no_border, corner_to_point + no_border).x;
+    }
+    return saturate(0.5 - sdf);
+}
+
+struct LayerCompositeVertexOutput {
+    float4 position: SV_Position;
+    nointerpolation float4 mask_solid: COLOR0;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct LayerCompositeFragmentInput {
+    float4 position: SV_Position;
+    nointerpolation float4 mask_solid: COLOR0;
+};
+
+LayerCompositeVertexOutput layer_composite_vertex(uint vertex_id: SV_VertexID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    LayerComposite composite = layer_composites[0];
+
+    LayerCompositeVertexOutput output;
+    output.position = to_device_position(unit_vertex, composite.region);
+    output.mask_solid = prepare_fill_color(composite.layer.mask);
+    output.clip_distance = distance_from_clip_rect(unit_vertex, composite.region,
+                                                   composite.layer.content_mask);
+    return output;
+}
+
+// Picks the backdrop blur that a mask value asks for. The inputs hold the
+// backdrop blurred at a sixteenth, a quarter and the full radius, so the
+// radius grows by four from one level to the next. Each segment of the
+// mask range then multiplies the radius by the same factor, which reads
+// as a steady growth; levels spaced by two spend most of the range on
+// blurs that already look alike. The smoothstep on each segment keeps the
+// growth smooth where two segments meet; a straight mix bends there, and
+// the bend shows as a band across a soft gradient.
+float4 progressive_blur(float4 sharp, float4 low, float4 mid, float4 full, float amount) {
+    float t = amount * 3.0;
+    if (t < 1.0) {
+        return lerp(sharp, low, smoothstep(0.0, 1.0, t));
+    }
+    if (t < 2.0) {
+        return lerp(low, mid, smoothstep(0.0, 1.0, t - 1.0));
+    }
+    return lerp(mid, full, smoothstep(0.0, 1.0, t - 2.0));
+}
+
+// Samples through a Catmull-Rom kernel with nine bilinear reads. A blur
+// level lives in a texture up to eight times smaller than the layer, and
+// a plain bilinear read back bends at every texel of the small texture.
+// The bends show as bands across a soft gradient; a cubic kernel has no
+// bends.
+float4 catmull_rom_sample(Texture2D<float4> t, SamplerState s, float2 uv) {
+    float2 size;
+    t.GetDimensions(size.x, size.y);
+    float2 sample_pos = uv * size;
+    float2 centre = floor(sample_pos - 0.5) + 0.5;
+    float2 f = sample_pos - centre;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2;
+    float2 uv0 = (centre - 1.0) / size;
+    float2 uv12 = (centre + w2 / w12) / size;
+    float2 uv3 = (centre + 2.0) / size;
+    float4 result = float4(0.0, 0.0, 0.0, 0.0);
+    result += t.SampleLevel(s, float2(uv0.x, uv0.y), 0.0) * w0.x * w0.y;
+    result += t.SampleLevel(s, float2(uv12.x, uv0.y), 0.0) * w12.x * w0.y;
+    result += t.SampleLevel(s, float2(uv3.x, uv0.y), 0.0) * w3.x * w0.y;
+    result += t.SampleLevel(s, float2(uv0.x, uv12.y), 0.0) * w0.x * w12.y;
+    result += t.SampleLevel(s, float2(uv12.x, uv12.y), 0.0) * w12.x * w12.y;
+    result += t.SampleLevel(s, float2(uv3.x, uv12.y), 0.0) * w3.x * w12.y;
+    result += t.SampleLevel(s, float2(uv0.x, uv3.y), 0.0) * w0.x * w3.y;
+    result += t.SampleLevel(s, float2(uv12.x, uv3.y), 0.0) * w12.x * w3.y;
+    result += t.SampleLevel(s, float2(uv3.x, uv3.y), 0.0) * w3.x * w3.y;
+    return max(result, float4(0.0, 0.0, 0.0, 0.0));
+}
+
+// One blur level of a mask-weighted backdrop, divided back by the blurred
+// weight that rides in its alpha channel. The divide makes the level a
+// weighted average where every source pixel counts by its own mask value,
+// so a bright row under the clear end of the mask does not glow into the
+// blurred end.
+float4 masked_level(Texture2D<float4> t, SamplerState s, float2 uv, float alpha) {
+    float4 level = catmull_rom_sample(t, s, uv);
+    return float4(level.rgb / max(level.a, 1e-3), alpha);
+}
+
+struct PremaskVertexOutput {
+    float4 position: SV_Position;
+    float2 uv: TEXCOORD0;
+    nointerpolation float4 mask_solid: COLOR0;
+};
+
+PremaskVertexOutput premask_vertex(uint vertex_id: SV_VertexID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    LayerComposite composite = layer_composites[0];
+    PremaskVertexOutput output;
+    output.position = float4(unit_vertex.x * 2.0 - 1.0, 1.0 - unit_vertex.y * 2.0, 0.0, 1.0);
+    output.uv = unit_vertex;
+    output.mask_solid = prepare_fill_color(composite.layer.mask);
+    return output;
+}
+
+// Multiplies the backdrop by the mask, one pixel at a time, before the
+// blur passes read it. The alpha channel carries the weight out, so the
+// composite can divide the blur back into a weighted average. The square
+// biases the average towards the pixels the mask keeps most. With a plain
+// mask weight, a bright row near the clear end still tints the blurred
+// end, because its small weight rides on a large kernel.
+float4 premask_fragment(PremaskVertexOutput input): SV_Target {
+    LayerComposite composite = layer_composites[0];
+    EffectLayer layer = composite.layer;
+    float2 position = composite.region.origin + input.uv * composite.region.size;
+    float2 box_min = layer.bounds.origin;
+    float2 box_max = box_min + layer.bounds.size;
+    bool inside = all(position >= box_min) && all(position < box_max);
+    float mask = inside
+        ? saturate(gradient_color(layer.mask, position, layer.bounds, input.mask_solid).a)
+        : 0.0;
+    float weight = mask * mask;
+    float4 under = t_layer_under.SampleLevel(s_layer_exact, input.uv, 0.0);
+    return float4(under.rgb * weight, weight);
+}
+
+float4 layer_composite_fragment(LayerCompositeFragmentInput input): SV_Target {
+    LayerComposite composite = layer_composites[0];
+    EffectLayer layer = composite.layer;
+    float2 position = input.position.xy;
+    float2 uv = (position - composite.region.origin) / composite.region.size;
+
+    float4 under = t_layer_under.SampleLevel(s_layer_exact, uv, 0.0);
+    float4 content = layer.blur > 0.0 ? t_sprite.SampleLevel(s_sprite, uv, 0.0)
+                                      : t_sprite.SampleLevel(s_layer_exact, uv, 0.0);
+    content = filter_color(layer.color_matrix, content) * layer.opacity;
+
+    float shape = box_coverage(position, layer.bounds, layer.corner_radii, layer.corner_shapes);
+    if (layer.clips_content != 0) {
+        content *= shape;
+    }
+    float keep = 1.0;
+    if (layer.has_mask != 0) {
+        float2 box_min = layer.bounds.origin;
+        float2 box_max = box_min + layer.bounds.size;
+        bool inside = all(position >= box_min) && all(position < box_max);
+        keep = inside ? gradient_color(layer.mask, position, layer.bounds, input.mask_solid).a : 0.0;
+    }
+
+    float4 base = under;
+    if (layer.has_backdrop != 0) {
+        float4 backdrop = under;
+        if (layer.backdrop_blur > 0.0) {
+            if (layer.has_mask != 0) {
+                // The levels hold the backdrop weighted by the mask, from
+                // the premask pass. Divide each back before the mix.
+                backdrop = progressive_blur(under,
+                                            masked_level(t_layer_backdrop_low, s_sprite, uv, under.a),
+                                            masked_level(t_layer_backdrop_mid, s_sprite, uv, under.a),
+                                            masked_level(t_layer_backdrop, s_sprite, uv, under.a),
+                                            keep);
+            } else {
+                backdrop = t_layer_backdrop.SampleLevel(s_sprite, uv, 0.0);
+            }
+        }
+        backdrop = lerp(backdrop, filter_color(layer.backdrop_matrix, backdrop), keep);
+        base = lerp(under, backdrop, shape);
+    }
+
+    float4 result = blend_over(layer.blend_mode, base, content);
+    return lerp(base, result, keep);
 }
