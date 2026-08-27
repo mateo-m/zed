@@ -1050,9 +1050,11 @@ impl StateInner {
 
         let mut rendered_focused_item = false;
 
+        // Items lay out inside the horizontal padding, the way children of
+        // a padded box do.
         let available_item_space = size(
             available_width.map_or(AvailableSpace::MaxContent, |width| {
-                AvailableSpace::Definite(width)
+                AvailableSpace::Definite(width - padding.left - padding.right)
             }),
             AvailableSpace::MinContent,
         );
@@ -1260,7 +1262,12 @@ impl StateInner {
         window.transact(|window| {
             match self.measuring_behavior {
                 ListMeasuringBehavior::Measure(has_measured) if !has_measured => {
-                    self.layout_all_items(bounds.size.width, render_item, window, cx);
+                    self.layout_all_items(
+                        bounds.size.width - padding.left - padding.right,
+                        render_item,
+                        window,
+                        cx,
+                    );
                 }
                 _ => {}
             }
@@ -1279,7 +1286,7 @@ impl StateInner {
 
             // Only paint the visible items, if there is actually any space for them (taking padding into account)
             if bounds.size.height > padding.top + padding.bottom {
-                let mut item_origin = bounds.origin + Point::new(px(0.), padding.top);
+                let mut item_origin = bounds.origin + Point::new(padding.left, padding.top);
                 item_origin.y -= layout_response.scroll_top.offset_in_item;
                 for item in &mut layout_response.item_layouts {
                     window.with_content_mask(Some(ContentMask { bounds }), |window| {
@@ -1309,7 +1316,8 @@ impl StateInner {
                                     let size = prev_item.size().unwrap_or_else(|| {
                                         let mut element = render_item(cursor.start().0, window, cx);
                                         let item_available_size = size(
-                                            bounds.size.width.into(),
+                                            (bounds.size.width - padding.left - padding.right)
+                                                .into(),
                                             AvailableSpace::MinContent,
                                         );
                                         element.layout_as_root(item_available_size, window, cx)
@@ -1338,8 +1346,10 @@ impl StateInner {
 
                                 let size = item.size().unwrap_or_else(|| {
                                     let mut item = render_item(cursor.start().0, window, cx);
-                                    let item_available_size =
-                                        size(bounds.size.width.into(), AvailableSpace::MinContent);
+                                    let item_available_size = size(
+                                        (bounds.size.width - padding.left - padding.right).into(),
+                                        AvailableSpace::MinContent,
+                                    );
                                     item.layout_as_root(item_available_size, window, cx)
                                 });
                                 height -= size.height;
