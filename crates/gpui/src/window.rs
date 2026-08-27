@@ -4028,6 +4028,19 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let content_mask = self.content_mask();
+        // A content blur bleeds past the border box, the way a CSS filter
+        // does, so the layer grows by the blur's support of three sigmas.
+        // The backdrop, the mask and the corner clip all map over the
+        // layer's bounds, so the layer only grows when none of them is set.
+        let bounds = if effects.blur > px(0.)
+            && effects.mask.is_none()
+            && !effects.has_backdrop()
+            && !effects.clips
+        {
+            bounds.dilate(px((3.0 * effects.blur.0).ceil()))
+        } else {
+            bounds
+        };
         let clipped_bounds = bounds.intersect(&content_mask.bounds);
         if effects.is_none() || clipped_bounds.is_empty() {
             return f(self);
