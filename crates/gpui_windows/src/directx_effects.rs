@@ -44,6 +44,9 @@ struct BlurParams {
 struct LayerComposite {
     layer: EffectLayer,
     region: Bounds<ScaledPixels>,
+    /// Which axis a variable blur pass runs along: 0 is x, 1 is y. The
+    /// composite draw does not read it.
+    blur_axis: u32,
 }
 
 /// Everything from the renderer that one frame of layer work needs.
@@ -73,14 +76,10 @@ struct OpenLayer {
     texture: Option<LayerTexture>,
 }
 
-/// The pixel format of the mask-weighted backdrop chain. The composite
-/// divides these textures by their alpha, and an 8 bit level would step
-/// visibly after the divide.
-const MASKED_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
-
 pub(crate) struct DirectXEffects {
     blur: PipelineState<BlurParams>,
-    premask: PipelineState<LayerComposite>,
+    /// The blur whose width follows the mask of the layer, pixel by pixel.
+    variable_blur: PipelineState<LayerComposite>,
     composite: PipelineState<LayerComposite>,
     smooth_sampler: Option<ID3D11SamplerState>,
     exact_sampler: Option<ID3D11SamplerState>,
@@ -97,10 +96,10 @@ impl DirectXEffects {
             1,
             create_blend_state_without_blending(device)?,
         )?;
-        let premask = PipelineState::new(
+        let variable_blur = PipelineState::new(
             device,
-            "layer_premask_pipeline",
-            ShaderModule::Premask,
+            "layer_variable_blur_pipeline",
+            ShaderModule::VariableBlur,
             1,
             create_blend_state_without_blending(device)?,
         )?;
@@ -113,7 +112,7 @@ impl DirectXEffects {
         )?;
         Ok(Self {
             blur,
-            premask,
+            variable_blur,
             composite,
             smooth_sampler: create_clamp_sampler(device, D3D11_FILTER_MIN_MAG_MIP_LINEAR)?,
             exact_sampler: create_clamp_sampler(device, D3D11_FILTER_MIN_MAG_MIP_POINT)?,
@@ -204,6 +203,7 @@ impl DirectXEffects {
         let composite_params = LayerComposite {
             layer: *layer,
             region: region.bounds(),
+            blur_axis: 0,
         };
 
         let blurred_content = if layer.blur > 0.0 {
@@ -213,40 +213,19 @@ impl DirectXEffects {
         };
 
         let backdrop_blurs = layer.has_backdrop != 0 && layer.backdrop_blur > 0.0;
-        // A mask over a blurred backdrop asks for a blur that grows with
-        // the mask. The blur must only read pixels the mask covers, or the
-        // colours next to the mask bleed in. The premask pass multiplies
-        // the backdrop by the mask and keeps the weight in alpha, so the
-        // composite can divide it back out.
-        let progressive = backdrop_blurs && layer.has_mask != 0;
-        let masked = if progressive {
-            let masked = self.take_texture(frame, region, MASKED_FORMAT)?;
-            self.premask_pass(frame, &under, &masked, composite_params)?;
-            Some(masked)
-        } else {
-            None
-        };
-        let backdrop_source = masked.as_ref().unwrap_or(&under);
+        // A mask over a blurred backdrop asks for a blur whose width
+        // follows the mask, pixel by pixel. That blur reads the mask, so
+        // it runs at full size, not on the shrunk texture the fixed blur
+        // uses.
         let blurred_under = if backdrop_blurs {
-            Some(self.blur(frame, backdrop_source, region, layer.backdrop_blur)?)
+            Some(if layer.has_mask != 0 {
+                self.variable_blur(frame, &under, region, composite_params)?
+            } else {
+                self.blur(frame, &under, region, layer.backdrop_blur)?
+            })
         } else {
             None
         };
-        // Two much weaker blurs give the shader levels to mix, so the blur
-        // amount can ramp over a wide range of the mask.
-        let blurred_mid = if progressive {
-            Some(self.blur(frame, backdrop_source, region, layer.backdrop_blur * 0.25)?)
-        } else {
-            None
-        };
-        let blurred_low = if progressive {
-            Some(self.blur(frame, backdrop_source, region, layer.backdrop_blur * 0.0625)?)
-        } else {
-            None
-        };
-        if let Some(texture) = masked {
-            self.give_back(texture);
-        }
 
         let parent_view = self.target_view(frame.view).clone();
         self.composite
@@ -257,12 +236,7 @@ impl DirectXEffects {
             let backdrop = blurred_under.as_ref().unwrap_or(&under);
             context.PSSetShaderResources(
                 2,
-                Some(&[
-                    under.resource.clone(),
-                    backdrop.resource.clone(),
-                    blurred_mid.as_ref().unwrap_or(backdrop).resource.clone(),
-                    blurred_low.as_ref().unwrap_or(backdrop).resource.clone(),
-                ]),
+                Some(&[under.resource.clone(), backdrop.resource.clone()]),
             );
             context.PSSetSamplers(1, Some(slice::from_ref(&self.exact_sampler)));
         }
@@ -279,10 +253,7 @@ impl DirectXEffects {
         if let Some(texture) = blurred_content {
             self.give_back(texture);
         }
-        for texture in [blurred_under, blurred_mid, blurred_low]
-            .into_iter()
-            .flatten()
-        {
+        if let Some(texture) = blurred_under {
             self.give_back(texture);
         }
         Ok(())
@@ -385,18 +356,50 @@ impl DirectXEffects {
         Ok(())
     }
 
-    /// Writes `under` times the mask into `target`, with the mask weight in
-    /// alpha. The composite divides the blurred result by that alpha, so
-    /// the blur average only counts pixels the mask covers.
-    fn premask_pass(
+    /// Two passes of the variable blur, one per axis, at the full region
+    /// size. Each pass reads the mask of the layer and blurs every pixel
+    /// with the sigma the mask asks for there.
+    fn variable_blur(
         &mut self,
         frame: &EffectFrame,
-        under: &LayerTexture,
+        source: &LayerTexture,
+        region: LayerRegion,
+        composite: LayerComposite,
+    ) -> Result<LayerTexture> {
+        let size = LayerRegion::new(0, 0, region.width, region.height);
+        let first = self.take_texture(frame, size, source.format)?;
+        self.variable_blur_pass(
+            frame,
+            source,
+            &first,
+            LayerComposite {
+                blur_axis: 0,
+                ..composite
+            },
+        )?;
+        let second = self.take_texture(frame, size, source.format)?;
+        self.variable_blur_pass(
+            frame,
+            &first,
+            &second,
+            LayerComposite {
+                blur_axis: 1,
+                ..composite
+            },
+        )?;
+        self.give_back(first);
+        Ok(second)
+    }
+
+    fn variable_blur_pass(
+        &mut self,
+        frame: &EffectFrame,
+        source: &LayerTexture,
         target: &LayerTexture,
         params: LayerComposite,
     ) -> Result<()> {
         let context = frame.device_context;
-        self.premask
+        self.variable_blur
             .update_buffer(frame.device, context, &[params])?;
         unsafe {
             context.OMSetRenderTargets(Some(slice::from_ref(&target.view)), None);
@@ -408,12 +411,10 @@ impl DirectXEffects {
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             }]));
-            context.PSSetShaderResources(2, Some(&[under.resource.clone()]));
-            context.PSSetSamplers(1, Some(slice::from_ref(&self.exact_sampler)));
         }
-        self.premask.draw_with_texture(
+        self.variable_blur.draw_with_texture(
             context,
-            slice::from_ref(&under.resource),
+            slice::from_ref(&source.resource),
             slice::from_ref(&self.smooth_sampler),
             1,
         )?;
@@ -512,7 +513,7 @@ fn copy_region(
 fn unbind_textures(context: &ID3D11DeviceContext) {
     unsafe {
         context.PSSetShaderResources(0, Some(&[None]));
-        context.PSSetShaderResources(2, Some(&[None, None, None, None]));
+        context.PSSetShaderResources(2, Some(&[None, None]));
     }
 }
 
@@ -553,6 +554,6 @@ mod tests {
     #[test]
     fn params_match_the_shader_layout() {
         assert_eq!(std::mem::size_of::<BlurParams>(), 16);
-        assert_eq!(std::mem::size_of::<LayerComposite>(), 620);
+        assert_eq!(std::mem::size_of::<LayerComposite>(), 624);
     }
 }
