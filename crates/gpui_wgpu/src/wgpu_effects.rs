@@ -36,13 +36,15 @@ struct BlurParams {
 
 /// One composite draw. The region sits first so the `Bounds` inside the
 /// layer keep their 8 byte alignment in the storage buffer, and the
-/// padding brings the size up to the WGSL stride.
+/// axis field brings the size up to the WGSL stride.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct LayerComposite {
     region: Bounds<ScaledPixels>,
     layer: EffectLayer,
-    _pad: u32,
+    /// Which axis a variable blur pass runs along: 0 is x, 1 is y. The
+    /// composite draw does not read it.
+    blur_axis: u32,
 }
 
 // `ParamsBuffer::write` reads these structs as raw bytes, which is only
@@ -102,25 +104,16 @@ impl EffectLayouts {
                 texture(2),
                 sampler(3, wgpu::SamplerBindingType::Filtering),
                 sampler(4, wgpu::SamplerBindingType::NonFiltering),
-                texture(5),
-                texture(6),
             ],
         });
         Self { params, textures }
     }
 }
 
-/// The pixel format of the mask-weighted backdrop chain. The composite
-/// divides these textures by their alpha, and an 8 bit level would step
-/// visibly after the divide.
-const MASKED_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
-
 pub(crate) struct EffectPipelines {
     blur: wgpu::RenderPipeline,
-    /// The blur again, drawing into [`MASKED_FORMAT`].
-    blur_float: wgpu::RenderPipeline,
-    /// Writes the backdrop times its mask into [`MASKED_FORMAT`].
-    premask: wgpu::RenderPipeline,
+    /// The blur whose width follows the mask of the layer, pixel by pixel.
+    variable_blur: wgpu::RenderPipeline,
     composite: wgpu::RenderPipeline,
 }
 
@@ -173,8 +166,12 @@ impl EffectPipelines {
         };
         Self {
             blur: create("effect_blur", "vs_blur", "fs_blur", format),
-            blur_float: create("effect_blur_float", "vs_blur", "fs_blur", MASKED_FORMAT),
-            premask: create("effect_premask", "vs_premask", "fs_premask", MASKED_FORMAT),
+            variable_blur: create(
+                "effect_variable_blur",
+                "vs_variable_blur",
+                "fs_variable_blur",
+                format,
+            ),
             composite: create(
                 "effect_composite",
                 "vs_layer_composite",
@@ -435,60 +432,30 @@ impl Effects {
         let composite = LayerComposite {
             region: region.bounds(),
             layer: *layer,
-            _pad: 0,
+            blur_axis: 0,
         };
 
         let blurred_content = (layer.blur > 0.0)
             .then(|| work.blur(&content, region, layer.blur, frame.format));
-        // A mask over a blurred backdrop asks for a blur that grows with
-        // the mask. Two weaker blurs give the shader levels to mix, and
-        // the mask weighs every level's source pixels, so the blur is an
-        // average of what the mask keeps and nothing else.
+        // A mask over a blurred backdrop asks for a blur whose width
+        // follows the mask, pixel by pixel. That blur reads the mask,
+        // so it runs at full size, not on the shrunk texture the fixed
+        // blur uses.
         let backdrop_blurs = layer.has_backdrop != 0 && layer.backdrop_blur > 0.0;
-        let progressive = backdrop_blurs && layer.has_mask != 0;
-        let masked = progressive.then(|| {
-            let texture = work.pool.take(frame, region, MASKED_FORMAT);
-            work.premask_pass(&under, &texture, &composite);
-            texture
+        let blurred_under = backdrop_blurs.then(|| {
+            if layer.has_mask != 0 {
+                work.variable_blur(&under, region, &composite)
+            } else {
+                work.blur(&under, region, layer.backdrop_blur, frame.format)
+            }
         });
-        let backdrop_format = if progressive {
-            MASKED_FORMAT
-        } else {
-            frame.format
-        };
-        let backdrop_source = masked.as_ref().unwrap_or(&under);
-        let blurred_under = backdrop_blurs
-            .then(|| work.blur(backdrop_source, region, layer.backdrop_blur, backdrop_format));
-        let blurred_mid = progressive.then(|| {
-            work.blur(
-                backdrop_source,
-                region,
-                layer.backdrop_blur * 0.25,
-                backdrop_format,
-            )
-        });
-        let blurred_low = progressive.then(|| {
-            work.blur(
-                backdrop_source,
-                region,
-                layer.backdrop_blur * 0.0625,
-                backdrop_format,
-            )
-        });
-        if let Some(texture) = masked {
-            work.pool.give_back(texture);
-        }
 
         let params = work.params.write(frame, &composite);
         let backdrop = blurred_under.as_ref().unwrap_or(&under);
         let textures = work.texture_bind_group(
             blurred_content.as_ref().unwrap_or(&content),
             &under,
-            [
-                backdrop,
-                blurred_mid.as_ref().unwrap_or(backdrop),
-                blurred_low.as_ref().unwrap_or(backdrop),
-            ],
+            backdrop,
         );
         {
             let mut pass = begin_pass(work.encoder, parent_view, false, "layer_composite");
@@ -504,10 +471,7 @@ impl Effects {
         if let Some(texture) = blurred_content {
             work.pool.give_back(texture);
         }
-        for texture in [blurred_under, blurred_mid, blurred_low]
-            .into_iter()
-            .flatten()
-        {
+        if let Some(texture) = blurred_under {
             work.pool.give_back(texture);
         }
     }
@@ -573,7 +537,6 @@ impl Work<'_> {
                     sigma: 1.0,
                     radius: 0,
                 },
-                format,
             );
             if let Some(texture) = shrunk {
                 self.pool.give_back(texture);
@@ -591,7 +554,6 @@ impl Work<'_> {
                 sigma,
                 radius,
             },
-            format,
         );
         if let Some(texture) = shrunk {
             self.pool.give_back(texture);
@@ -605,46 +567,56 @@ impl Work<'_> {
                 sigma,
                 radius,
             },
-            format,
         );
         self.pool.give_back(first);
         second
     }
 
-    fn blur_pass(
-        &mut self,
-        source: &LayerTexture,
-        target: &LayerTexture,
-        params: BlurParams,
-        format: wgpu::TextureFormat,
-    ) {
+    fn blur_pass(&mut self, source: &LayerTexture, target: &LayerTexture, params: BlurParams) {
         let params = self.params.write(self.frame, &params);
-        let textures = self.texture_bind_group(source, source, [source; 3]);
+        let textures = self.texture_bind_group(source, source, source);
         let mut pass = begin_pass(self.encoder, &target.view, true, "layer_blur");
-        pass.set_pipeline(if format == MASKED_FORMAT {
-            &self.frame.pipelines.blur_float
-        } else {
-            &self.frame.pipelines.blur
-        });
+        pass.set_pipeline(&self.frame.pipelines.blur);
         pass.set_bind_group(0, self.frame.globals, &[]);
         pass.set_bind_group(1, &params, &[]);
         pass.set_bind_group(2, &textures, &[]);
         pass.draw(0..4, 0..1);
     }
 
-    /// Writes `under` times the squared mask of the layer into `target`,
-    /// with the weight in alpha. The blur of this texture is a weighted
-    /// average of only the pixels the mask keeps.
-    fn premask_pass(
+    /// Blurs `source` with the Gaussian the mask of the layer asks for at
+    /// each pixel: the mask value there times the `backdrop_blur` sigma.
+    /// Two passes, one per axis, at full size, because every pixel has its
+    /// own width and a shrunk texture would lose the sharp end.
+    fn variable_blur(
         &mut self,
-        under: &LayerTexture,
+        source: &LayerTexture,
+        region: LayerRegion,
+        composite: &LayerComposite,
+    ) -> LayerTexture {
+        let size = LayerRegion::new(0, 0, region.width, region.height);
+        let first = self.pool.take(self.frame, size, self.frame.format);
+        self.variable_blur_pass(source, &first, composite, 0);
+        let second = self.pool.take(self.frame, size, self.frame.format);
+        self.variable_blur_pass(&first, &second, composite, 1);
+        self.pool.give_back(first);
+        second
+    }
+
+    fn variable_blur_pass(
+        &mut self,
+        source: &LayerTexture,
         target: &LayerTexture,
         composite: &LayerComposite,
+        blur_axis: u32,
     ) {
-        let params = self.params.write(self.frame, composite);
-        let textures = self.texture_bind_group(under, under, [under; 3]);
-        let mut pass = begin_pass(self.encoder, &target.view, true, "layer_premask");
-        pass.set_pipeline(&self.frame.pipelines.premask);
+        let composite = LayerComposite {
+            blur_axis,
+            ..*composite
+        };
+        let params = self.params.write(self.frame, &composite);
+        let textures = self.texture_bind_group(source, source, source);
+        let mut pass = begin_pass(self.encoder, &target.view, true, "layer_variable_blur");
+        pass.set_pipeline(&self.frame.pipelines.variable_blur);
         pass.set_bind_group(0, self.frame.globals, &[]);
         pass.set_bind_group(1, &params, &[]);
         pass.set_bind_group(2, &textures, &[]);
@@ -655,7 +627,7 @@ impl Work<'_> {
         &self,
         content: &LayerTexture,
         under: &LayerTexture,
-        backdrop: [&LayerTexture; 3],
+        backdrop: &LayerTexture,
     ) -> wgpu::BindGroup {
         self.frame
             .device
@@ -673,7 +645,7 @@ impl Work<'_> {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&backdrop[0].view),
+                        resource: wgpu::BindingResource::TextureView(&backdrop.view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
@@ -682,14 +654,6 @@ impl Work<'_> {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: wgpu::BindingResource::Sampler(&self.samplers.exact),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: wgpu::BindingResource::TextureView(&backdrop[1].view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: wgpu::BindingResource::TextureView(&backdrop[2].view),
                     },
                 ],
             })
