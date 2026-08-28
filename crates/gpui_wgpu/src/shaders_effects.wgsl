@@ -303,14 +303,15 @@ fn vs_layer_composite(@builtin(vertex_index) vertex_id: u32) -> LayerCompositeVa
     return out;
 }
 
-// Picks the backdrop blur that a mask value asks for. The inputs hold the
-// backdrop blurred at a sixteenth, a quarter and the full radius, so the
-// radius grows by four from one level to the next. Each segment of the
-// mask range then multiplies the radius by the same factor, which reads
-// as a steady growth; levels spaced by two spend most of the range on
-// blurs that already look alike. The smoothstep on each segment keeps the
-// growth smooth where two segments meet; a straight mix bends there, and
-// the bend shows as a band across a soft gradient.
+// Picks the backdrop blur that a mask value asks for. The inputs hold
+// the backdrop blurred at a sixteenth, a quarter and the full radius.
+// The target radius is the mask value times the full radius, so a
+// gradient mask reads as a straight ramp of the radius. Each range of
+// the mask mixes the two levels around the target. The mix weight
+// matches the variance of the target kernel, because a mix of two
+// Gaussian blurs adds their variances by the mix weights. The width of
+// the mixed kernel then tracks the target radius across the whole
+// ramp, with no flat spans and no jumps.
 fn progressive_blur(
     sharp: vec4<f32>,
     low: vec4<f32>,
@@ -318,14 +319,14 @@ fn progressive_blur(
     full: vec4<f32>,
     amount: f32,
 ) -> vec4<f32> {
-    let t = amount * 3.0;
-    if (t < 1.0) {
-        return mix(sharp, low, smoothstep(0.0, 1.0, t));
+    let variance = amount * amount;
+    if (amount < 1.0 / 16.0) {
+        return mix(sharp, low, variance * 256.0);
     }
-    if (t < 2.0) {
-        return mix(low, mid, smoothstep(0.0, 1.0, t - 1.0));
+    if (amount < 0.25) {
+        return mix(low, mid, (variance - 1.0 / 256.0) * (256.0 / 15.0));
     }
-    return mix(mid, full, smoothstep(0.0, 1.0, t - 2.0));
+    return mix(mid, full, (variance - 1.0 / 16.0) * (16.0 / 15.0));
 }
 
 // Samples through a Catmull-Rom kernel with nine bilinear reads. A blur
