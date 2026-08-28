@@ -2389,6 +2389,17 @@ impl Window {
         self.on_next_frame(move |_, cx| cx.notify(entity));
     }
 
+    /// Whether the window is marked to redraw on the next frame.
+    ///
+    /// Tests read this right after an event dispatch to assert that a
+    /// handler scheduled a paint. The test harness paints on demand, so
+    /// it can never lose a frame request the way the platform frame
+    /// loop can, and the mark is the only trace of the request.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn needs_paint(&self) -> bool {
+        self.invalidator.is_dirty()
+    }
+
     /// Runs all callbacks scheduled via [`Self::on_next_frame`], returning how many ran.
     ///
     /// Tests have no platform frame loop, so this simulates the delivery of the
