@@ -61,7 +61,8 @@ const _: () = assert!(
 pub(crate) struct EffectLayouts {
     /// Group 1: one storage buffer with `BlurParams` or `LayerComposite`.
     pub params: wgpu::BindGroupLayout,
-    /// Group 2: content, under and backdrop textures plus two samplers.
+    /// Group 2: content, under, backdrop and shadow textures plus two
+    /// samplers.
     pub textures: wgpu::BindGroupLayout,
 }
 
@@ -104,6 +105,7 @@ impl EffectLayouts {
                 texture(2),
                 sampler(3, wgpu::SamplerBindingType::Filtering),
                 sampler(4, wgpu::SamplerBindingType::NonFiltering),
+                texture(5),
             ],
         });
         Self { params, textures }
@@ -435,8 +437,15 @@ impl Effects {
             blur_axis: 0,
         };
 
-        let blurred_content = (layer.blur > 0.0)
-            .then(|| work.blur(&content, region, layer.blur, frame.format));
+        let blurred_content =
+            (layer.blur > 0.0).then(|| work.blur(&content, region, layer.blur, frame.format));
+        // The shadow is the content blurred by its own sigma on top of the
+        // content blur. A Gaussian of a Gaussian is a Gaussian, so one blur
+        // of the sharp content with the two sigmas added in quadrature
+        // gives it, and a sharp shadow reads the content as it is.
+        let shadow_sigma = (layer.blur * layer.blur + layer.shadow_blur * layer.shadow_blur).sqrt();
+        let blurred_shadow = (layer.has_shadow != 0 && shadow_sigma > 0.0)
+            .then(|| work.blur(&content, region, shadow_sigma, frame.format));
         // A mask over a blurred backdrop asks for a blur whose width
         // follows the mask, pixel by pixel. That blur reads the mask,
         // so it runs at full size, not on the shrunk texture the fixed
@@ -456,6 +465,7 @@ impl Effects {
             blurred_content.as_ref().unwrap_or(&content),
             &under,
             backdrop,
+            blurred_shadow.as_ref().unwrap_or(&content),
         );
         {
             let mut pass = begin_pass(work.encoder, parent_view, false, "layer_composite");
@@ -472,6 +482,9 @@ impl Effects {
             work.pool.give_back(texture);
         }
         if let Some(texture) = blurred_under {
+            work.pool.give_back(texture);
+        }
+        if let Some(texture) = blurred_shadow {
             work.pool.give_back(texture);
         }
     }
@@ -574,7 +587,7 @@ impl Work<'_> {
 
     fn blur_pass(&mut self, source: &LayerTexture, target: &LayerTexture, params: BlurParams) {
         let params = self.params.write(self.frame, &params);
-        let textures = self.texture_bind_group(source, source, source);
+        let textures = self.texture_bind_group(source, source, source, source);
         let mut pass = begin_pass(self.encoder, &target.view, true, "layer_blur");
         pass.set_pipeline(&self.frame.pipelines.blur);
         pass.set_bind_group(0, self.frame.globals, &[]);
@@ -614,7 +627,7 @@ impl Work<'_> {
             ..*composite
         };
         let params = self.params.write(self.frame, &composite);
-        let textures = self.texture_bind_group(source, source, source);
+        let textures = self.texture_bind_group(source, source, source, source);
         let mut pass = begin_pass(self.encoder, &target.view, true, "layer_variable_blur");
         pass.set_pipeline(&self.frame.pipelines.variable_blur);
         pass.set_bind_group(0, self.frame.globals, &[]);
@@ -628,6 +641,7 @@ impl Work<'_> {
         content: &LayerTexture,
         under: &LayerTexture,
         backdrop: &LayerTexture,
+        shadow: &LayerTexture,
     ) -> wgpu::BindGroup {
         self.frame
             .device
@@ -654,6 +668,10 @@ impl Work<'_> {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: wgpu::BindingResource::Sampler(&self.samplers.exact),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&shadow.view),
                     },
                 ],
             })
@@ -727,7 +745,7 @@ mod tests {
     #[test]
     fn params_match_the_shader_layout() {
         assert_eq!(std::mem::size_of::<BlurParams>(), 16);
-        assert_eq!(std::mem::size_of::<LayerComposite>(), 628);
+        assert_eq!(std::mem::size_of::<LayerComposite>(), 660);
         assert_eq!(std::mem::offset_of!(LayerComposite, layer), 16);
     }
 }
